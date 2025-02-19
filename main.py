@@ -39,7 +39,9 @@ def list_files_in_folder(service, folder_id):
         query = f"'{folder_id}' in parents"
         results = service.files().list(
             q=query,
-            fields="files(id, name, mimeType, parents, trashed)"
+            fields="files(id, name, mimeType, parents, trashed)",
+            includeItemsFromAllDrives=True,
+            supportsAllDrives=True
         ).execute()
 
         # Exclude trashed files
@@ -98,7 +100,7 @@ def export_drive_files(service, source_folder_id, target_folder_id, recursive=Fa
                 }
 
                 media = MediaIoBaseUpload(pdf_data, mimetype='application/pdf', resumable=True)
-                service.files().create(body=pdf_metadata, media_body=media).execute()
+                service.files().create(body=pdf_metadata, media_body=media, supportsAllDrives=True).execute()
                 print(f"Exported and uploaded {file['name']} as a PDF.")
 
             elif mime_type == 'application/vnd.google-apps.presentation':
@@ -112,7 +114,7 @@ def export_drive_files(service, source_folder_id, target_folder_id, recursive=Fa
                 }
 
                 media = MediaIoBaseUpload(pdf_data, mimetype='application/pdf', resumable=True)
-                service.files().create(body=pdf_metadata, media_body=media).execute()
+                service.files().create(body=pdf_metadata, media_body=media, supportsAllDrives=True).execute()
                 print(f"Exported and uploaded {file['name']} as a PDF.")
 
             else:
@@ -121,8 +123,13 @@ def export_drive_files(service, source_folder_id, target_folder_id, recursive=Fa
                     'name': file['name'],
                     'parents': [target_folder_id]
                 }
+                
+                service.files().copy(
+                    fileId=file['id'],
+                    body=copied_file_metadata,
+                    supportsAllDrives=True
+                ).execute()
 
-                service.files().copy(fileId=file['id'], body=copied_file_metadata).execute()
                 print(f"Copied {file['name']} to the target folder.")
 
     except Exception as e:
@@ -131,13 +138,14 @@ def export_drive_files(service, source_folder_id, target_folder_id, recursive=Fa
 def create_shareable_link(service, file_id):
     """Creates a shareable link to the file with public access."""
     try:
-        permission = {
-            'type': 'domain',
-            'role': 'reader',
-            'domain': 'fysiksektionen.se'
-        }
-        service.permissions().create(fileId=file_id, body=permission).execute()
-        file = service.files().get(fileId=file_id, fields="webViewLink").execute()
+        # permission = {
+        #     'type': 'domain',
+        #     'role': 'reader',
+        #     'domain': 'fysiksektionen.se'
+        # }
+        #
+        # service.permissions().create(fileId=file_id, body=permission).execute()
+        file = service.files().get(fileId=file_id, fields="webViewLink", supportsAllDrives=True).execute()
         return file.get('webViewLink')
     except Exception as e:
         print(f"An error occurred: {e}")
