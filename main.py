@@ -51,68 +51,115 @@ def list_files_in_folder(service, folder_id):
         print(f"An error occurred while listing files: {e}")
         return []
 
-def list_files_in_folder_recursive(service, folder_id):
-    """Lists all files inside the given Google Drive folder and its subfolders."""
+def list_files_in_folder_recursive(service, folder_id, current_path=""):
+    """
+    Lists all files inside the given Google Drive folder and its subfolders.
+    Each file dictionary gets an extra key 'relative_path' showing its location
+    relative to the source folder.
+    """
     try:
-        items = list_files_in_folder(service, folder_id)
-
-        for item in items:
-            if item['mimeType'] == 'application/vnd.google-apps.folder':
-                # Recursively list files in subfolders
-                subfolder_items = list_files_in_folder_recursive(service, item['id'])
-                items.extend(subfolder_items)
-
+        items = []
+        files = list_files_in_folder(service, folder_id)
+        for file in files:
+            file_copy = file.copy()
+            file_copy['relative_path'] = current_path  # record the current relative path
+            items.append(file_copy)
+            if file['mimeType'] == 'application/vnd.google-apps.folder':
+                # Recurse into the subfolder, appending its name to the current path
+                sub_items = list_files_in_folder_recursive(service, file['id'], current_path + file['name'] + "/")
+                items.extend(sub_items)
         return items
-
     except Exception as e:
-        print(f"An error occurred while listing files: {e}")
+        print(f"An error occurred while listing files recursively: {e}")
         return []
 
-def export_drive_files(service, source_folder_id, target_folder_id, recursive=False, file_regex=None):
-    """Exports Google Docs and Slides to PDF and copies other files to the target folder."""
-    try:
-        files = list_files_in_folder_recursive(service, source_folder_id) if recursive else list_files_in_folder(service, source_folder_id)
+def get_or_create_target_folder(service, parent_folder_id, folder_names):
+    """
+    Given a parent folder ID and a list of folder names,
+    get (or create) the nested folder structure and return the deepest folder ID.
+    """
+    current_parent = parent_folder_id
+    for folder_name in folder_names:
+        if not folder_name:
+            continue  # Skip any empty folder names
+        query = (
+            f"'{current_parent}' in parents and "
+            f"name='{folder_name}' and "
+            "mimeType='application/vnd.google-apps.folder' and trashed=false"
+        )
+        results = service.files().list(q=query, fields="files(id)").execute()
+        files = results.get('files', [])
+        if files:
+            # Use the existing folder
+            current_parent = files[0]['id']
+        else:
+            # Create the folder if it doesn't exist
+            folder_metadata = {
+                'name': folder_name,
+                'mimeType': 'application/vnd.google-apps.folder',
+                'parents': [current_parent]
+            }
+            new_folder = service.files().create(body=folder_metadata, fields='id').execute()
+            current_parent = new_folder.get('id')
+    return current_parent
 
+def export_drive_files(service, source_folder_id, target_folder_id, recursive=False, file_regex=None):
+    """
+    Exports Google Docs/Slides to PDF and copies other files to the target folder
+    while preserving the folder structure. For each file, its relative path is used
+    to recreate the folder hierarchy under the target folder.
+    """
+    try:
+        if recursive:
+            files = list_files_in_folder_recursive(service, source_folder_id)
+        else:
+            files = list_files_in_folder(service, source_folder_id)
+            # For non-recursive mode, assign an empty relative path to each file
+            for file in files:
+                file['relative_path'] = ""
+        
         if file_regex is not None:
             files = list(filter(lambda file: re.match(file_regex, file['name']), files))
-
+        
         if not files:
             print("No matching files found in the source folder.")
             return
 
         for file in files:
-            mime_type = file['mimeType']
-
-            if mime_type == 'application/vnd.google-apps.folder':
-                # Do not process Google Drive folders
+            # Skip processing folders; we only process actual files
+            if file['mimeType'] == 'application/vnd.google-apps.folder':
                 continue
+
+            # Determine the target parent folder based on the file's relative path
+            target_parent = target_folder_id
+            relative_path = file.get('relative_path', "")
+            if relative_path:
+                # Split the relative path into folder names (ignoring any trailing slash)
+                folder_names = relative_path.strip("/").split("/")
+                target_parent = get_or_create_target_folder(service, target_folder_id, folder_names)
 
             print(f"Processing {file['name']}...")
 
-            if mime_type == 'application/vnd.google-apps.document':
+            if file['mimeType'] == 'application/vnd.google-apps.document':
                 # Export Google Docs to PDF
                 request = service.files().export_media(fileId=file['id'], mimeType='application/pdf')
                 pdf_data = io.BytesIO(request.execute())
-
                 pdf_metadata = {
                     'name': f"{file['name']}.pdf",
-                    'parents': [target_folder_id]
+                    'parents': [target_parent]
                 }
-
                 media = MediaIoBaseUpload(pdf_data, mimetype='application/pdf', resumable=True)
                 service.files().create(body=pdf_metadata, media_body=media, supportsAllDrives=True).execute()
                 print(f"Exported and uploaded {file['name']} as a PDF.")
 
-            elif mime_type == 'application/vnd.google-apps.presentation':
+            elif file['mimeType'] == 'application/vnd.google-apps.presentation':
                 # Export Google Slides to PDF
                 request = service.files().export_media(fileId=file['id'], mimeType='application/pdf')
                 pdf_data = io.BytesIO(request.execute())
-
                 pdf_metadata = {
                     'name': f"{file['name']}.pdf",
-                    'parents': [target_folder_id]
+                    'parents': [target_parent]
                 }
-
                 media = MediaIoBaseUpload(pdf_data, mimetype='application/pdf', resumable=True)
                 service.files().create(body=pdf_metadata, media_body=media, supportsAllDrives=True).execute()
                 print(f"Exported and uploaded {file['name']} as a PDF.")
@@ -121,34 +168,24 @@ def export_drive_files(service, source_folder_id, target_folder_id, recursive=Fa
                 # Copy other files directly
                 copied_file_metadata = {
                     'name': file['name'],
-                    'parents': [target_folder_id]
+                    'parents': [target_parent]
                 }
-                
                 service.files().copy(
                     fileId=file['id'],
                     body=copied_file_metadata,
                     supportsAllDrives=True
                 ).execute()
-
                 print(f"Copied {file['name']} to the target folder.")
-
     except Exception as e:
         print(f"An error occurred while processing files: {e}")
 
 def create_shareable_link(service, file_id):
     """Creates a shareable link to the file with public access."""
     try:
-        # permission = {
-        #     'type': 'domain',
-        #     'role': 'reader',
-        #     'domain': 'fysiksektionen.se'
-        # }
-        #
-        # service.permissions().create(fileId=file_id, body=permission).execute()
         file = service.files().get(fileId=file_id, fields="webViewLink", supportsAllDrives=True).execute()
         return file.get('webViewLink')
     except Exception as e:
-        print(f"An error occurred: {e}")
+        print(f"An error occurred while creating shareable link: {e}")
         return None
 
 def sort_and_indent_files(files):
@@ -223,13 +260,13 @@ def create_links_for_drive_folder(service, folder_id, recursive=False, file_rege
         print(f"An error occurred while processing the folder: {e}")
 
 def print_files_in_drive_folder(service, folder_id, recursive=False, file_regex=None, print_dirs=False):
-    """Prints a a list of files in a Google Drive folder."""
+    """Prints a list of files in a Google Drive folder."""
     files = list_files_in_folder_recursive(service, folder_id) if recursive else list_files_in_folder(service, folder_id)
 
     if file_regex is not None:
         files = list(filter(lambda file: re.match(file_regex, file['name']), files))
 
-    # Filter out directories
+    # Filter out directories if print_dirs is False
     if not print_dirs:
         files = list(filter(lambda file: file['mimeType'] != 'application/vnd.google-apps.folder', files))
 
@@ -242,7 +279,8 @@ def main():
     service = authenticate_google_account()
 
     parser = argparse.ArgumentParser(description="Attachments helper")
-    parser.add_argument("operation", choices=["table", "pdfs", "print"], help="Operation to perform: 'table' to generate a Table of Contents, 'print' to print the files or 'pdfs' to export files")
+    parser.add_argument("operation", choices=["table", "pdfs", "print"],
+                        help="Operation to perform: 'table' to generate a Table of Contents, 'print' to print the files or 'pdfs' to export files")
     parser.add_argument("source_folder", help="Source Google Drive folder ID")
     parser.add_argument("destination_folder", nargs="?", help="Target Google Drive folder ID (required for 'pdfs' operation)")
     parser.add_argument("-r", "--recursive", action="store_true", help="Include subdirectories in the operation")
